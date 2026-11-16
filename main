@@ -1,0 +1,1683 @@
+// ==UserScript==
+// @name         SRM eCurricula AutoFill - Link Filler + TOTP + Auto-Chain
+// @namespace    local.srm.linkfiller
+// @version      5.1.2
+// @author       Pranesh D.
+// @description  SLO link import, session navigation, cross-unit chaining and TOTP helper.
+// @match        https://dld.srmist.edu.in/ktretecurricula/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @run-at       document-idle
+// ==/UserScript==
+
+//  ____  ____  __  __      ____  __  __
+// / ___||  _ \|  \/  |    / ___||  \/  |
+// \___ \| |_) | |\/| |    \___ \| |\/| |
+//  ___) |  _ <| |  | |     ___) | |  | |
+// |____/|_| \_\_|  |_|    |____/|_|  |_|
+//
+//  SRM eCurricula AutoFill :: v5.1.2
+//  Author: Pranesh D.
+//  ------------------------------------------------------------
+
+(function () {
+  'use strict';
+
+  // ============================================================
+  // 01. CONFIGURATION & STATE
+  // ============================================================
+
+  const UNITS = [1, 2, 3, 4, 5];
+  const SESSIONS = 9;
+
+  const INPUT_SEL = 'input[id^="studentPractice"][id$="Link"]';
+  const DEFAULT_SECRET = '';
+
+  const key = (u, s, n) => `link:u${u}:s${s}:slo${n}`;
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // Accept Google Drive and Google Docs URLs.
+  const isDrive = (value) =>
+    /^https:\/\/(drive|docs)\.google\.com\//i.test((value || '').trim());
+
+  let targetUnit = +GM_getValue('targetUnit', 1);
+
+  if (!UNITS.includes(targetUnit)) {
+    targetUnit = 1;
+  }
+
+  let viewUnit = +GM_getValue('viewUnit', targetUnit);
+
+  if (!UNITS.includes(viewUnit)) {
+    viewUnit = targetUnit;
+  }
+
+  let totpSecret = (
+    GM_getValue('totpSecret', DEFAULT_SECRET) || DEFAULT_SECRET
+  ).trim();
+
+  // One-time migration for v5.1.2.
+  // Cross-unit chaining is enabled by default.
+  // The user can disable it from the interface.
+  if (!GM_getValue('v512MigrationDone', false)) {
+    GM_setValue('crossunit', true);
+    GM_setValue('v512MigrationDone', true);
+  }
+
+  let lastUsedOtp = null;
+  let stopRequested = false;
+  let busy = false;
+
+
+  // ============================================================
+  // 02. TOTP IMPLEMENTATION
+  // ============================================================
+
+  // Decode a Base32-encoded TOTP secret.
+  function base32Decode(encoded) {
+    const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+    encoded = (encoded || '')
+      .replace(/[=\s]/g, '')
+      .toUpperCase();
+
+    let bits = '';
+
+    for (const character of encoded) {
+      const value = ALPHABET.indexOf(character);
+
+      if (value === -1) {
+        throw new Error('Invalid Base32 character: ' + character);
+      }
+
+      bits += value.toString(2).padStart(5, '0');
+    }
+
+    const bytes = new Uint8Array(Math.floor(bits.length / 8));
+
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = parseInt(
+        bits.slice(i * 8, i * 8 + 8),
+        2
+      );
+    }
+
+    return bytes;
+  }
+
+
+  // Generate a time-based one-time password.
+  async function generateTOTP(secret, timeStepSeconds = 30, digits = 6) {
+    if (!secret) {
+      return {
+        otp: 'SET KEY',
+        remaining: 0,
+        error: 'TOTP secret is not configured'
+      };
+    }
+
+    try {
+      const keyBytes = base32Decode(secret);
+
+      const epoch = Math.floor(Date.now() / 1000);
+      const counter = Math.floor(epoch / timeStepSeconds);
+
+      const counterBuf = new ArrayBuffer(8);
+      const view = new DataView(counterBuf);
+
+      view.setUint32(4, counter, false);
+      view.setUint32(
+        0,
+        Math.floor(counter / 0x100000000),
+        false
+      );
+
+      const cryptoKey = await window.crypto.subtle.importKey(
+        'raw',
+        keyBytes,
+        {
+          name: 'HMAC',
+          hash: 'SHA-1'
+        },
+        false,
+        ['sign']
+      );
+
+      const signature = await window.crypto.subtle.sign(
+        'HMAC',
+        cryptoKey,
+        counterBuf
+      );
+
+      const hmac = new Uint8Array(signature);
+
+      const offset = hmac[hmac.length - 1] & 0x0f;
+
+      const code =
+        ((hmac[offset] & 0x7f) << 24) |
+        ((hmac[offset + 1] & 0xff) << 16) |
+        ((hmac[offset + 2] & 0xff) << 8) |
+        (hmac[offset + 3] & 0xff);
+
+      const otp = (code % Math.pow(10, digits))
+        .toString()
+        .padStart(digits, '0');
+
+      const remaining =
+        timeStepSeconds - (epoch % timeStepSeconds);
+
+      return {
+        otp,
+        remaining
+      };
+
+    } catch (err) {
+      return {
+        otp: '------',
+        remaining: 0,
+        error: err.message
+      };
+    }
+  }
+
+
+  // Wait for a fresh OTP instead of reusing an expired one.
+  async function ensureFreshTOTP() {
+    while (!stopRequested) {
+      const { otp, remaining } = await generateTOTP(totpSecret);
+
+      if (otp !== lastUsedOtp && remaining >= 3) {
+        return otp;
+      }
+
+      const waitSec =
+        otp === lastUsedOtp ? remaining : remaining + 1;
+
+      say(`⏳ Waiting ${waitSec}s for fresh TOTP code...`);
+
+      await sleep(1000);
+    }
+
+    return null;
+  }
+
+
+  // ============================================================
+  // 03. DOM & REACT HELPERS
+  // ============================================================
+
+  // Update React-controlled input fields correctly.
+  function setReactValue(el, value) {
+    const setter =
+      Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        'value'
+      )?.set ||
+      Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        'value'
+      )?.set;
+
+    if (setter) {
+      setter.call(el, value);
+    } else {
+      el.value = value;
+    }
+
+    el.dispatchEvent(
+      new Event('input', { bubbles: true })
+    );
+
+    el.dispatchEvent(
+      new Event('change', { bubbles: true })
+    );
+  }
+
+
+  // Detect the currently open Unit and Session.
+  function currentSession() {
+    const text = [...document.querySelectorAll(
+      '.ant-card-head-title, .userPageHeader, h3, h4'
+    )]
+      .map((el) => el.textContent || '')
+      .find((value) =>
+        /Learning Unit/i.test(value) ||
+        (
+          /Unit\s*:\s*\d+/i.test(value) &&
+          /Session\s*:\s*(\d+)/i.test(value)
+        )
+      );
+
+    const match = text && text.match(
+      /Unit\s*:\s*(\d+)\s*&?\s*Session\s*:\s*(\d+)/i
+    );
+
+    return match
+      ? {
+          unit: +match[1],
+          session: +match[2]
+        }
+      : null;
+  }
+
+
+  // Identify the SLO number associated with an input.
+  function sloOf(input) {
+    let tr = input.closest('tr');
+
+    while (tr) {
+      const th = tr.querySelector(
+        ':scope > th, :scope > td:first-child'
+      );
+
+      const match = th &&
+        th.textContent.match(/SLO\s*(\d+)/i);
+
+      if (match) {
+        return +match[1];
+      }
+
+      tr = tr.parentElement &&
+        tr.parentElement.closest('tr');
+    }
+
+    const id = input.id.match(/\d+/);
+
+    return id ? +id[0] : null;
+  }
+
+
+  // Trigger a click sequence on an element.
+  function realClick(el) {
+    if (!el) return;
+
+    el.click();
+
+    ['mousedown', 'mouseup', 'click'].forEach((type) => {
+      el.dispatchEvent(
+        new MouseEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          buttons: 1
+        })
+      );
+    });
+  }
+
+
+  // ============================================================
+  // 04. LEARNING PRACTICE PANEL DETECTION
+  // ============================================================
+
+  // Expand Learning Practice panels and wait for their inputs.
+  async function waitForAndExpandInputs(
+    expectedCount = 2,
+    timeoutMs = 8000
+  ) {
+    const start = Date.now();
+
+    say('📂 Expanding Learning Practice panels...');
+
+    while (Date.now() - start < timeoutMs) {
+      if (stopRequested) return [];
+
+      const practiceHeaders = [
+        ...document.querySelectorAll('.ant-collapse-header')
+      ].filter((header) =>
+        /Learning\s*Practice/i.test(header.textContent || '')
+      );
+
+      for (const header of practiceHeaders) {
+        const item = header.closest('.ant-collapse-item');
+
+        const isExpanded =
+          header.getAttribute('aria-expanded') === 'true' ||
+          (
+            item &&
+            item.classList.contains('ant-collapse-item-active')
+          );
+
+        if (!isExpanded) {
+          realClick(header);
+
+          const titleSpan = header.querySelector(
+            '.ant-collapse-title'
+          );
+
+          if (titleSpan) {
+            realClick(titleSpan);
+          }
+
+          await sleep(250);
+        }
+      }
+
+      await sleep(350);
+
+      const inputs = [
+        ...document.querySelectorAll(INPUT_SEL)
+      ];
+
+      if (inputs.length >= expectedCount) {
+        return inputs;
+      }
+
+      if (
+        inputs.length > 0 &&
+        practiceHeaders.length > 0 &&
+        inputs.length >= practiceHeaders.length
+      ) {
+        return inputs;
+      }
+    }
+
+    return [
+      ...document.querySelectorAll(INPUT_SEL)
+    ];
+  }
+
+
+  // ============================================================
+  // 05. STORED LINK MANAGEMENT
+  // ============================================================
+
+  // Check whether a session has at least one stored link.
+  function hasStoredLinksForSession(unit, session) {
+    const link1 = (
+      GM_getValue(key(unit, session, 1), '') || ''
+    ).trim();
+
+    const link2 = (
+      GM_getValue(key(unit, session, 2), '') || ''
+    ).trim();
+
+    return isDrive(link1) || isDrive(link2);
+  }
+
+
+  // Find the next session with stored links.
+  // Search current unit first, then later units if enabled.
+  function findNextTargetSession(
+    curUnit,
+    curSess,
+    crossUnits = false
+  ) {
+    for (
+      let session = curSess + 1;
+      session <= SESSIONS;
+      session++
+    ) {
+      if (hasStoredLinksForSession(curUnit, session)) {
+        return {
+          unit: curUnit,
+          session
+        };
+      }
+    }
+
+    if (crossUnits) {
+      for (
+        let unit = curUnit + 1;
+        unit <= 5;
+        unit++
+      ) {
+        for (
+          let session = 1;
+          session <= SESSIONS;
+          session++
+        ) {
+          if (hasStoredLinksForSession(unit, session)) {
+            return {
+              unit,
+              session
+            };
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+
+  // ============================================================
+  // 06. SUNBURST WHEEL NAVIGATION
+  // ============================================================
+
+  // Trigger the wheel's native pointer/mouse events.
+  // Supports DOM elements, D3 selections and jQuery-like wrappers.
+  function clickSunburstArc(arcEl) {
+    if (!arcEl) {
+      throw new Error('Sunburst arc element not found.');
+    }
+
+    let el = arcEl;
+
+    if (typeof el.node === 'function') {
+      el = el.node();
+
+    } else if (
+      typeof el.get === 'function' &&
+      !el.dispatchEvent
+    ) {
+      el = el.get(0);
+
+    } else if (
+      !el.dispatchEvent &&
+      el[0] &&
+      el[0].dispatchEvent
+    ) {
+      el = el[0];
+    }
+
+    if (!el || typeof el.dispatchEvent !== 'function') {
+      throw new Error(
+        'Sunburst target is not a DOM element. Check the wheel segment selector.'
+      );
+    }
+
+    const rect = el.getBoundingClientRect();
+
+    const clientX = rect.left + rect.width / 2;
+    const clientY = rect.top + rect.height / 2;
+
+    [
+      'pointerdown',
+      'mousedown',
+      'pointerup',
+      'mouseup',
+      'click'
+    ].forEach((type) => {
+      const EventClass = type.startsWith('pointer')
+        ? PointerEvent
+        : MouseEvent;
+
+      el.dispatchEvent(
+        new EventClass(type, {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          clientX,
+          clientY,
+          button: 0,
+          buttons: type.endsWith('down') ? 1 : 0
+        })
+      );
+    });
+
+    // D3 event-handler fallback.
+    try {
+      const rawNode = el.wrappedJSObject || el;
+
+      if (Array.isArray(rawNode.__on)) {
+        const d3Click = rawNode.__on.find(
+          (entry) => entry && entry.type === 'click'
+        );
+
+        if (
+          d3Click &&
+          typeof d3Click.value === 'function'
+        ) {
+          d3Click.value.call(
+            rawNode,
+            new MouseEvent('click', {
+              bubbles: true,
+              cancelable: true,
+              clientX,
+              clientY
+            }),
+            rawNode.__data__
+          );
+        }
+      }
+
+    } catch (err) {
+      console.warn(
+        '[SRM AutoFill] D3 click fallback:',
+        err
+      );
+    }
+  }
+
+
+  // Navigate to a session by clicking its SLO 1 wheel segment.
+  async function navigateToSessionViaWheel(
+    targetU,
+    targetS
+  ) {
+    const current = currentSession();
+
+    if (
+      current &&
+      current.unit === targetU &&
+      current.session === targetS
+    ) {
+      return true;
+    }
+
+    const slo1ArcId =
+      `mainArc-${targetU * 1000 + targetS * 10 + 1}`;
+
+    let arcEl = null;
+
+    // Wait for lazy-loaded wheel segments.
+    for (
+      let i = 0;
+      i < 40 && !stopRequested;
+      i++
+    ) {
+      arcEl = document.getElementById(slo1ArcId);
+
+      if (arcEl) break;
+
+      await sleep(250);
+    }
+
+    if (!arcEl) {
+      say(
+        `⚠️ Wheel segment #${slo1ArcId} did not appear after 10 seconds.`
+      );
+
+      return false;
+    }
+
+    arcEl.scrollIntoView({
+      behavior: 'instant',
+      block: 'center'
+    });
+
+    await sleep(150);
+
+    say(`🎡 Opening Unit ${targetU} Session ${targetS}...`);
+
+    clickSunburstArc(arcEl);
+
+    // Confirm that the target session actually opened.
+    for (let w = 0; w < 24; w++) {
+      await sleep(250);
+
+      const now = currentSession();
+
+      if (
+        now &&
+        now.unit === targetU &&
+        now.session === targetS
+      ) {
+        await sleep(1200);
+        return true;
+      }
+    }
+
+    say(`⚠️ Session switch failed: U${targetU} S${targetS}.`);
+
+    return false;
+  }
+
+
+  // ============================================================
+  // 07. OTP VERIFICATION HANDLER
+  // ============================================================
+
+  async function waitForAndFillOTP(timeoutMs = 8000) {
+    const start = Date.now();
+
+    say('⏳ Waiting for OTP prompt...');
+
+    while (Date.now() - start < timeoutMs) {
+      if (stopRequested) return false;
+
+      const otpInputs = [
+        ...document.querySelectorAll(
+          '.ant-otp-input, input.ant-otp-input, input[placeholder*="6-digit"], input[placeholder*="code"], input[placeholder*="OTP"]'
+        )
+      ];
+
+      const activeModal = document.querySelector(
+        '.ant-modal-content, .ant-modal, .otp-modal'
+      );
+
+      if (
+        otpInputs.length > 0 ||
+        (
+          activeModal &&
+          activeModal.textContent.includes('6-digit')
+        )
+      ) {
+        say('🔑 OTP prompt detected...');
+
+        await sleep(250);
+
+        const otp = await ensureFreshTOTP();
+
+        if (
+          !otp ||
+          otp === '------' ||
+          otp === 'SET KEY'
+        ) {
+          say('⚠️ TOTP generation failed or was stopped.');
+          return false;
+        }
+
+        say('🔑 Filling TOTP code...');
+
+        // Handle six separate OTP input boxes.
+        if (otpInputs.length === 6) {
+          for (let i = 0; i < 6; i++) {
+            setReactValue(otpInputs[i], otp[i]);
+            await sleep(50);
+          }
+
+        // Handle one combined OTP input.
+        } else if (otpInputs.length > 0) {
+          setReactValue(otpInputs[0], otp);
+        }
+
+        // Dispatch a paste event as an additional compatibility step.
+        if (otpInputs[0]) {
+          try {
+            const dt = new DataTransfer();
+
+            dt.setData('text/plain', otp);
+
+            otpInputs[0].dispatchEvent(
+              new ClipboardEvent('paste', {
+                bubbles: true,
+                cancelable: true,
+                clipboardData: dt
+              })
+            );
+
+          } catch (_) {}
+        }
+
+        await sleep(400);
+
+        const verifyBtn = [
+          ...document.querySelectorAll('button, .ant-btn')
+        ].find((button) =>
+          /verify/i.test(button.textContent || '') &&
+          !button.disabled &&
+          button.offsetParent !== null
+        );
+
+        if (verifyBtn) {
+          say('🚀 Clicking Verify...');
+          verifyBtn.click();
+        }
+
+        // Wait for modal closure or verification error.
+        for (let wait = 0; wait < 30; wait++) {
+          await sleep(200);
+
+          const errEl = document.querySelector(
+            '.ant-alert-error, .ant-message-error, .ant-form-item-explain-error'
+          );
+
+          if (
+            errEl &&
+            errEl.offsetParent !== null
+          ) {
+            say(
+              '❌ OTP verification error: ' +
+              (errEl.textContent || 'Failed').trim()
+            );
+
+            return false;
+          }
+
+          const stillOpen = document.querySelector(
+            '.ant-modal-content, .ant-modal, .otp-modal'
+          );
+
+          if (!stillOpen) {
+            lastUsedOtp = otp;
+
+            say('✅ TOTP verified successfully!');
+
+            return true;
+          }
+        }
+
+        lastUsedOtp = otp;
+
+        return true;
+      }
+
+      await sleep(250);
+    }
+
+    say('ℹ️ No OTP prompt detected for this step.');
+
+    return true;
+  }
+
+
+  // ============================================================
+  // 08. FLOATING CONTROL PANEL
+  // ============================================================
+
+  // Remove any previous instance before creating the new panel.
+  const oldBox = document.getElementById('srm-autofill-box');
+
+  if (oldBox) {
+    oldBox.remove();
+  }
+
+  const box = document.createElement('div');
+
+  box.id = 'srm-autofill-box';
+
+  box.style.cssText =
+    'position:fixed;right:14px;bottom:14px;z-index:999999;width:370px;max-height:88vh;overflow-y:auto;' +
+    'background:#ffffff;border:1px solid #cdd9ec;border-radius:12px;box-shadow:0 8px 30px rgba(15,23,42,.2);' +
+    'font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#1e293b;padding:12px';
+
+  box.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #e2e8f0;padding-bottom:8px">
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:16px">🎓</span>
+        <strong style="color:#1d4ed8;font-size:13px">eCurricula AutoFill v5.1.2</strong>
+      </div>
+
+      <div style="display:flex;align-items:center;gap:8px">
+        <button id="lf-secret-btn" title="Edit TOTP Secret" style="border:0;background:none;cursor:pointer;font-size:13px">⚙️</button>
+        <button id="lf-toggle" title="Minimize" style="border:0;background:none;cursor:pointer;font-size:16px;font-weight:bold;color:#64748b">−</button>
+      </div>
+    </div>
+
+    <div id="lf-body" style="margin-top:8px">
+
+      <div style="background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff;border-radius:8px;padding:8px 12px;margin-bottom:8px;text-align:center">
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:10px;opacity:.9">
+          <span>CURRENT TOTP</span>
+          <span id="lf-totp-rem">--s</span>
+        </div>
+
+        <div id="lf-totp-code" style="font-size:24px;font-weight:bold;letter-spacing:4px;font-family:Consolas,monospace;margin:2px 0">
+          ------
+        </div>
+
+        <div style="height:3px;background:rgba(255,255,255,.2);border-radius:2px;overflow:hidden">
+          <div id="lf-totp-bar" style="height:100%;width:100%;background:#fbbf24;transition:width 1s linear"></div>
+        </div>
+      </div>
+
+
+      <!-- TOTP SETTINGS -->
+
+      <div id="lf-secret-pane" style="display:none;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:8px;margin-bottom:8px">
+        <div style="font-weight:600;margin-bottom:4px">TOTP Secret Key</div>
+
+        <input
+          type="text"
+          id="lf-secret-input"
+          value=""
+          style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid #cbd5e1;border-radius:4px;font-family:monospace;font-size:11px"
+        />
+
+        <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:6px">
+          <button id="lf-secret-save" style="background:#1d4ed8;color:#fff;border:0;border-radius:4px;padding:4px 10px;cursor:pointer">
+            Save
+          </button>
+        </div>
+      </div>
+
+
+      <!-- TARGET UNIT -->
+
+      <div style="margin-bottom:6px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+          <label style="font-weight:600;color:#334155">
+            Target Unit to Upload:
+          </label>
+
+          <select id="lf-target-unit" style="padding:2px 6px;border:1px solid #cbd5e1;border-radius:4px;background:#fff;font-weight:600;color:#1d4ed8">
+            ${UNITS.map((u) =>
+              `<option value="${u}" ${u === targetUnit ? 'selected' : ''}>Unit ${u}</option>`
+            ).join('')}
+          </select>
+        </div>
+
+        <div id="lf-cur" style="font-size:11px;color:#64748b;background:#f1f5f9;padding:4px 6px;border-radius:4px">
+          Detecting current open session...
+        </div>
+      </div>
+
+
+      <!-- JSON IMPORT -->
+
+      <div style="margin-bottom:8px">
+        <button id="lf-json-toggle" style="width:100%;background:#f8fafc;border:1px dashed #94a3b8;border-radius:6px;padding:5px;cursor:pointer;font-size:11px;font-weight:600;color:#2563eb">
+          📋 Paste Bulk SLO Links (JSON) ▼
+        </button>
+
+        <div id="lf-json-pane" style="display:none;margin-top:6px">
+          <textarea
+            id="lf-json-input"
+            rows="6"
+            placeholder='[
+  { "slo": 1, "comp1Link": "https://drive.google.com/...", "comp2Link": "..." },
+  { "slo": 2, "comp1Link": "...", "comp2Link": "..." }
+]'
+            style="width:100%;box-sizing:border-box;padding:5px;border:1px solid #cbd5e1;border-radius:6px;font-family:monospace;font-size:10px;resize:vertical"
+          ></textarea>
+
+          <div style="display:flex;gap:6px;margin-top:4px">
+            <button id="lf-json-load" style="flex:1;background:#2563eb;color:#fff;border:0;border-radius:4px;padding:5px;cursor:pointer;font-weight:600">
+              Apply Links to Unit <span id="lf-apply-unit">${targetUnit}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+
+      <!-- LINK REVIEW -->
+
+      <div style="font-weight:600;margin-bottom:3px;font-size:11px;color:#475569">
+        Review Links by Unit:
+      </div>
+
+      <div id="lf-tabs" style="display:flex;gap:4px;margin-bottom:6px"></div>
+
+      <div id="lf-fields" style="max-height:150px;overflow-y:auto;border:1px solid #f1f5f9;padding:4px;border-radius:6px;background:#fafafa"></div>
+
+
+      <!-- AUTOMATION OPTIONS -->
+
+      <div style="margin-top:8px;padding-top:6px;border-top:1px solid #e2e8f0">
+
+        <label style="display:flex;align-items:center;gap:6px;margin-bottom:3px;cursor:pointer">
+          <input type="checkbox" id="lf-click" checked>
+          <span>Click <strong>UPDATE</strong> after filling links</span>
+        </label>
+
+        <label style="display:flex;align-items:center;gap:6px;margin-bottom:3px;cursor:pointer">
+          <input type="checkbox" id="lf-autototp" checked>
+          <span>Auto-fill <strong>TOTP & Verify</strong></span>
+        </label>
+
+        <label style="display:flex;align-items:center;gap:6px;margin-bottom:3px;cursor:pointer">
+          <input type="checkbox" id="lf-autonext" checked>
+          <span><strong>Auto-click "1" of next S#</strong> on wheel</span>
+        </label>
+
+        <label style="display:flex;align-items:center;gap:6px;margin-bottom:3px;cursor:pointer">
+          <input type="checkbox" id="lf-crossunit">
+          <span>Continue across <strong>next Units</strong> (U1 → U5)</span>
+        </label>
+
+        <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;cursor:pointer">
+          <input type="checkbox" id="lf-auto">
+          <span>Auto-run immediately when page loads</span>
+        </label>
+
+      </div>
+
+
+      <!-- RUN / STOP -->
+
+      <div style="display:flex;gap:6px">
+
+        <button id="lf-run" style="flex:1;padding:8px;border:0;border-radius:6px;background:#1d4ed8;color:#fff;cursor:pointer;font-weight:600;font-size:13px;display:flex;justify-content:center;align-items:center;gap:6px">
+          <span>▶️</span>
+          <span id="lf-run-label">Start Auto-Chain</span>
+        </button>
+
+        <button id="lf-stop" style="display:none;padding:8px 12px;border:0;border-radius:6px;background:#dc2626;color:#fff;cursor:pointer;font-weight:600;font-size:13px">
+          ⏹ Stop
+        </button>
+
+      </div>
+
+      <div id="lf-msg" style="margin-top:6px;font-size:11px;color:#334155;background:#f8fafc;padding:5px 8px;border-radius:6px;min-height:22px;border:1px solid #e2e8f0;white-space:pre-wrap"></div>
+
+    </div>
+  `;
+
+
+  // ============================================================
+  // 09. PANEL HELPERS
+  // ============================================================
+
+  document.body.appendChild(box);
+
+  const $ = (selector) => box.querySelector(selector);
+
+  function say(message) {
+    const el = $('#lf-msg');
+
+    if (el) {
+      el.textContent = message;
+    }
+  }
+
+
+  // ============================================================
+  // 10. TOTP DISPLAY
+  // ============================================================
+
+  async function updateTOTPTicker() {
+    const { otp, remaining } = await generateTOTP(totpSecret);
+
+    const codeEl = $('#lf-totp-code');
+    const remEl = $('#lf-totp-rem');
+    const barEl = $('#lf-totp-bar');
+
+    if (codeEl) {
+      codeEl.textContent = otp;
+    }
+
+    if (remEl) {
+      remEl.textContent = `${remaining}s`;
+    }
+
+    if (barEl) {
+      const pct = (remaining / 30) * 100;
+
+      barEl.style.width = pct + '%';
+
+      barEl.style.background =
+        remaining <= 5 ? '#ef4444' :
+        remaining <= 10 ? '#f59e0b' :
+        '#fbbf24';
+    }
+  }
+
+  updateTOTPTicker();
+
+  setInterval(updateTOTPTicker, 1000);
+
+
+  // ============================================================
+  // 11. UI EVENT HANDLERS
+  // ============================================================
+
+  // Minimize / restore the panel.
+  $('#lf-toggle').onclick = () => {
+    const body = $('#lf-body');
+    const button = $('#lf-toggle');
+
+    if (body.style.display === 'none') {
+      body.style.display = '';
+      button.textContent = '−';
+    } else {
+      body.style.display = 'none';
+      button.textContent = '+';
+    }
+  };
+
+
+  // Open TOTP settings.
+  $('#lf-secret-btn').onclick = () => {
+    const pane = $('#lf-secret-pane');
+
+    const opening = pane.style.display === 'none';
+
+    if (opening) {
+      $('#lf-secret-input').value = totpSecret;
+    }
+
+    pane.style.display = opening ? 'block' : 'none';
+  };
+
+
+  // Save TOTP secret locally in Tampermonkey storage.
+  $('#lf-secret-save').onclick = () => {
+    const value = $('#lf-secret-input').value.trim();
+
+    if (value) {
+      totpSecret = value;
+
+      GM_setValue('totpSecret', value);
+
+      $('#lf-secret-pane').style.display = 'none';
+
+      say('✅ TOTP secret updated.');
+
+      updateTOTPTicker();
+    }
+  };
+
+
+  // Change the target upload unit.
+  $('#lf-target-unit').onchange = (event) => {
+    targetUnit = +event.target.value;
+
+    viewUnit = targetUnit;
+
+    GM_setValue('targetUnit', targetUnit);
+    GM_setValue('viewUnit', viewUnit);
+
+    $('#lf-apply-unit').textContent = targetUnit;
+
+    renderTabs();
+    renderFields();
+
+    say(`Target upload unit set to Unit ${targetUnit}.`);
+  };
+
+
+  // Expand / collapse JSON import area.
+  $('#lf-json-toggle').onclick = () => {
+    const pane = $('#lf-json-pane');
+
+    pane.style.display =
+      pane.style.display === 'none' ? 'block' : 'none';
+  };
+
+
+  // ============================================================
+  // 12. JSON BULK IMPORT
+  // ============================================================
+
+  // Supports both:
+  //
+  // A. Plain array:
+  // [
+  //   { "slo": 1, "comp1Link": "...", "comp2Link": "..." }
+  // ]
+  //
+  // B. Unit-wrapped object:
+  // {
+  //   "5": [
+  //     { "slo": 1, "comp1Link": "...", "comp2Link": "..." }
+  //   ]
+  // }
+  //
+  // For unit-wrapped JSON, the selected Target Unit determines
+  // which array is imported.
+
+  $('#lf-json-load').onclick = () => {
+    const raw = $('#lf-json-input').value.trim();
+
+    if (!raw) {
+      return say('❌ Paste JSON first.');
+    }
+
+    try {
+      const data = JSON.parse(raw);
+
+      const entries = Array.isArray(data)
+        ? data
+        : data && typeof data === 'object'
+          ? data[String(targetUnit)]
+          : null;
+
+      if (!Array.isArray(entries)) {
+        return say(
+          `❌ No valid array found for Unit ${targetUnit}.`
+        );
+      }
+
+      let imported = 0;
+      let sessionsImported = 0;
+      let invalid = 0;
+
+      entries.forEach((item) => {
+        if (!item || typeof item !== 'object') {
+          invalid++;
+          return;
+        }
+
+        const session = Number(item.slo || item.session);
+
+        if (
+          !Number.isInteger(session) ||
+          session < 1 ||
+          session > SESSIONS
+        ) {
+          invalid++;
+          return;
+        }
+
+        let importedThisSession = 0;
+
+        const link1 =
+          item.comp1Link ||
+          item.comp1 ||
+          item.link1;
+
+        const link2 =
+          item.comp2Link ||
+          item.comp2 ||
+          item.link2;
+
+        if (
+          typeof link1 === 'string' &&
+          isDrive(link1)
+        ) {
+          GM_setValue(
+            key(targetUnit, session, 1),
+            link1.trim()
+          );
+
+          imported++;
+          importedThisSession++;
+        }
+
+        if (
+          typeof link2 === 'string' &&
+          isDrive(link2)
+        ) {
+          GM_setValue(
+            key(targetUnit, session, 2),
+            link2.trim()
+          );
+
+          imported++;
+          importedThisSession++;
+        }
+
+        if (importedThisSession) {
+          sessionsImported++;
+        }
+      });
+
+      renderFields();
+
+      if (!imported) {
+        say(
+          '⚠️ No valid Google Drive/Docs links were imported. Check the URLs and SLO numbers.'
+        );
+
+      } else {
+        say(
+          `✅ Imported ${imported} links across ${sessionsImported} sessions into Unit ${targetUnit}.` +
+          (invalid ? ` ${invalid} invalid entries skipped.` : '')
+        );
+
+        $('#lf-json-pane').style.display = 'none';
+      }
+
+    } catch (err) {
+      say('❌ Invalid JSON: ' + err.message);
+    }
+  };
+
+
+  // ============================================================
+  // 13. PERSISTED OPTIONS
+  // ============================================================
+
+  $('#lf-click').checked =
+    GM_getValue('click', true);
+
+  $('#lf-autototp').checked =
+    GM_getValue('autototp', true);
+
+  $('#lf-autonext').checked =
+    GM_getValue('autonext', true);
+
+  $('#lf-crossunit').checked =
+    GM_getValue('crossunit', true);
+
+  $('#lf-auto').checked =
+    GM_getValue('auto', false);
+
+
+  // Save option changes.
+  $('#lf-click').onchange = (event) =>
+    GM_setValue('click', event.target.checked);
+
+  $('#lf-autototp').onchange = (event) =>
+    GM_setValue('autototp', event.target.checked);
+
+  $('#lf-autonext').onchange = (event) =>
+    GM_setValue('autonext', event.target.checked);
+
+  $('#lf-crossunit').onchange = (event) =>
+    GM_setValue('crossunit', event.target.checked);
+
+  $('#lf-auto').onchange = (event) =>
+    GM_setValue('auto', event.target.checked);
+
+
+  // Stop button.
+  $('#lf-stop').onclick = () => {
+    stopRequested = true;
+
+    say('🛑 Stopping after current step...');
+  };
+
+
+  // ============================================================
+  // 14. UNIT TABS & LINK FIELDS
+  // ============================================================
+
+  // Render Unit 1–5 tabs.
+  function renderTabs() {
+    const tabs = $('#lf-tabs');
+
+    tabs.innerHTML = '';
+
+    UNITS.forEach((unit) => {
+      const button = document.createElement('button');
+
+      button.textContent = `U${unit}`;
+
+      button.style.cssText =
+        'flex:1;padding:3px 0;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;border:1px solid #2563eb;' +
+        (
+          unit === viewUnit
+            ? 'background:#2563eb;color:#fff'
+            : 'background:#fff;color:#2563eb'
+        );
+
+      button.onclick = () => {
+        viewUnit = unit;
+
+        GM_setValue('viewUnit', unit);
+
+        renderTabs();
+        renderFields();
+      };
+
+      tabs.appendChild(button);
+    });
+  }
+
+
+  // Render the nine sessions and their two SLO link fields.
+  function renderFields() {
+    const fields = $('#lf-fields');
+
+    fields.innerHTML =
+      '<div style="display:grid;grid-template-columns:26px 1fr 1fr;gap:4px;font-weight:600;margin-bottom:2px;font-size:10px;color:#64748b">' +
+      '<span></span><span>SLO 1 LINK</span><span>SLO 2 LINK</span></div>';
+
+    for (let session = 1; session <= SESSIONS; session++) {
+      const row = document.createElement('div');
+
+      row.style.cssText =
+        'display:grid;grid-template-columns:26px 1fr 1fr;gap:4px;margin:2px 0;align-items:center';
+
+      row.innerHTML =
+        `<span style="font-weight:600;font-size:10px">S${session}</span>`;
+
+      [1, 2].forEach((n) => {
+        const input = document.createElement('input');
+
+        input.placeholder = `S${session} Comp ${n}`;
+
+        input.style.cssText =
+          'min-width:0;padding:2px 4px;border:1px solid #cbd5e1;border-radius:4px;font-size:10px';
+
+        input.value = GM_getValue(
+          key(viewUnit, session, n),
+          ''
+        );
+
+        input.addEventListener('input', () => {
+          GM_setValue(
+            key(viewUnit, session, n),
+            input.value.trim()
+          );
+        });
+
+        row.appendChild(input);
+      });
+
+      fields.appendChild(row);
+    }
+  }
+
+
+  renderTabs();
+  renderFields();
+
+
+  // ============================================================
+  // 15. SINGLE SESSION PROCESSOR
+  // ============================================================
+
+  async function processOpenSession(cur) {
+    const inputs = await waitForAndExpandInputs(2, 8000);
+
+    if (!inputs.length) {
+      say(
+        `⚠️ No link boxes found on U${cur.unit} S${cur.session} after expanding.`
+      );
+
+      return { ok: false };
+    }
+
+    const doClick = $('#lf-click').checked;
+    const doTOTP = $('#lf-autototp').checked;
+
+    if (doClick && doTOTP && !totpSecret) {
+      say(
+        '⚠️ TOTP is enabled but no secret is configured. Open ⚙️ and enter it, or disable auto TOTP.'
+      );
+
+      return { ok: false };
+    }
+
+    let done = 0;
+
+    const skipped = [];
+    const missing = [];
+
+    for (let i = 0; i < inputs.length; i++) {
+      if (stopRequested) {
+        return { ok: false };
+      }
+
+      const initialInput = inputs[i];
+
+      const n = sloOf(initialInput);
+
+      const input =
+        document.getElementById(`studentPractice${n}Link`) ||
+        initialInput;
+
+      // Do not overwrite a link that is already present.
+      if (input.value && isDrive(input.value)) {
+        skipped.push(n);
+        continue;
+      }
+
+      const link = (
+        GM_getValue(key(cur.unit, cur.session, n), '') || ''
+      ).trim();
+
+      if (!isDrive(link)) {
+        missing.push(n);
+        continue;
+      }
+
+      // Avoid reusing the previously verified OTP.
+      if (doClick && doTOTP && lastUsedOtp) {
+        await ensureFreshTOTP();
+
+        if (stopRequested) {
+          return { ok: false };
+        }
+      }
+
+      await waitForAndExpandInputs(2, 4000);
+
+      const liveInput =
+        document.getElementById(`studentPractice${n}Link`) ||
+        input;
+
+      setReactValue(liveInput, link);
+
+      say(
+        `📝 [U${cur.unit} S${cur.session}] Filled SLO ${n} link`
+      );
+
+      await sleep(400);
+
+      if (doClick) {
+        const row =
+          liveInput.closest('.ant-row') ||
+          liveInput.parentElement;
+
+        const btn = row &&
+          [...row.querySelectorAll('button')].find((button) =>
+            /update/i.test(button.textContent || '')
+          );
+
+        if (!btn) {
+          say(
+            `⚠️ UPDATE button not found for SLO ${n} on U${cur.unit} S${cur.session}. Stopping.`
+          );
+
+          return { ok: false };
+        }
+
+        // Wait for React to enable the UPDATE button.
+        for (let w = 0; w < 30 && btn.disabled; w++) {
+          await sleep(100);
+        }
+
+        if (btn.disabled) {
+          say(
+            `⚠️ UPDATE stayed disabled for SLO ${n}. Check the link.`
+          );
+
+          return { ok: false };
+        }
+
+        say(
+          `🚀 [U${cur.unit} S${cur.session}] Clicking UPDATE for SLO ${n}...`
+        );
+
+        btn.click();
+
+        await sleep(600);
+
+        if (doTOTP) {
+          const verified = await waitForAndFillOTP(8000);
+
+          if (!verified) {
+            say(
+              `⚠️ OTP verification failed on U${cur.unit} S${cur.session} SLO ${n}.`
+            );
+
+            return { ok: false };
+          }
+        }
+      }
+
+      done++;
+    }
+
+    say(
+      `✅ U${cur.unit} S${cur.session}: ${done} ${doClick ? 'submitted' : 'filled'}` +
+      (
+        skipped.length
+          ? `; SLO ${skipped.join(',')} skipped (already filled)`
+          : ''
+      ) +
+      (
+        missing.length
+          ? `; SLO ${missing.join(',')} had no stored link`
+          : ''
+      )
+    );
+
+    return {
+      ok: true,
+      done,
+      skipped,
+      missing
+    };
+  }
+
+
+  // ============================================================
+  // 16. MAIN AUTO-CHAIN EXECUTION LOOP
+  // ============================================================
+
+  async function run() {
+    if (busy) return;
+
+    busy = true;
+    stopRequested = false;
+
+    $('#lf-stop').style.display = 'block';
+    $('#lf-run-label').textContent = 'Running...';
+
+    try {
+      let cur = currentSession();
+
+      // If no session is open, start from the selected target unit.
+      if (!cur) {
+        const first = findNextTargetSession(
+          targetUnit,
+          0,
+          false
+        );
+
+        if (first) {
+          const opened = await navigateToSessionViaWheel(
+            first.unit,
+            first.session
+          );
+
+          if (opened) {
+            cur = currentSession();
+          }
+        }
+
+        if (!cur) {
+          say(
+            '⚠️ Click "1" of any session on the wheel first.'
+          );
+
+          return;
+        }
+      }
+
+      while (!stopRequested) {
+        // Keep the link-review tab synchronized with the active unit.
+        if (cur.unit !== viewUnit) {
+          viewUnit = cur.unit;
+
+          GM_setValue('viewUnit', viewUnit);
+
+          renderTabs();
+          renderFields();
+        }
+
+        const result = await processOpenSession(cur);
+
+        if (!result.ok || stopRequested) {
+          break;
+        }
+
+        const doAutoNext =
+          $('#lf-autonext').checked;
+
+        const doCrossUnit =
+          $('#lf-crossunit').checked;
+
+        if (!doAutoNext) {
+          break;
+        }
+
+        const nextTarget = findNextTargetSession(
+          cur.unit,
+          cur.session,
+          doCrossUnit
+        );
+
+        if (!nextTarget) {
+          say(
+            doCrossUnit
+              ? `🎉 Finished! No more stored links found from Unit ${cur.unit} through Unit 5.`
+              : `🎉 Unit ${cur.unit} finished. Enable cross-unit chaining to continue into later units.`
+          );
+
+          break;
+        }
+
+        await sleep(800);
+
+        const switched = await navigateToSessionViaWheel(
+          nextTarget.unit,
+          nextTarget.session
+        );
+
+        if (!switched) {
+          break;
+        }
+
+        cur = currentSession();
+
+        // Verify the wheel actually opened the requested session.
+        if (
+          !cur ||
+          cur.unit !== nextTarget.unit ||
+          cur.session !== nextTarget.session
+        ) {
+          say(
+            '⚠️ Session switch verification failed. Stopping chain.'
+          );
+
+          break;
+        }
+      }
+
+    } catch (err) {
+      say('❌ Error: ' + err.message);
+
+    } finally {
+      busy = false;
+      stopRequested = false;
+
+      $('#lf-stop').style.display = 'none';
+      $('#lf-run-label').textContent = 'Start Auto-Chain';
+    }
+  }
+
+
+  $('#lf-run').onclick = run;
+
+
+  // ============================================================
+  // 17. SESSION MONITOR
+  // ============================================================
+
+  let lastSig = null;
+
+  setInterval(async () => {
+    const current = currentSession();
+
+    const curEl = $('#lf-cur');
+
+    if (current) {
+      if (curEl) {
+        curEl.textContent =
+          `📍 Open now: Unit ${current.unit}, Session ${current.session}`;
+      }
+
+    } else if (curEl) {
+      curEl.textContent =
+        '📍 Click "1" of any session on the wheel';
+    }
+
+    const sig = current
+      ? `${current.unit}-${current.session}`
+      : null;
+
+    if (!sig || sig === lastSig) {
+      return;
+    }
+
+    lastSig = sig;
+
+    if (!busy && current.unit !== viewUnit) {
+      viewUnit = current.unit;
+
+      GM_setValue('viewUnit', viewUnit);
+
+      renderTabs();
+      renderFields();
+    }
+
+    if (!busy && $('#lf-auto').checked) {
+      await sleep(1000);
+
+      await run();
+    }
+
+  }, 1000);
+
+
+  // ============================================================
+  // 18. INITIALIZATION COMPLETE
+  // ============================================================
+
+  say('🟢 SRM AutoFill v5.1.2 ready. Select a unit and start.');
+
+  console.log(
+    '%c SRM eCurricula AutoFill v5.1.2 ',
+    'background:#1e3a8a;color:#ffffff;font-weight:bold;padding:4px 8px;'
+  );
+
+  console.log('Author: Pranesh D.');
+
+})();
